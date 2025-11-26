@@ -208,18 +208,36 @@ def get_universe(universe: str) -> list:
     return uniq
 
 
-# ---------- INDICATORS & RELAXED SCORING ----------
+# ---------- NORMALISATION & INDICATORS ----------
+
+def _normalize_price_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make sure df has simple, non-duplicated OHLC columns.
+    Handles occasional MultiIndex or duplicate column names from yfinance.
+    """
+    # Flatten MultiIndex by taking the first level
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = [col[0] for col in df.columns]
+
+    # Drop duplicate columns, keep first
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    # Keep only columns we care about if present
+    wanted = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+    df = df[wanted].copy()
+
+    return df
+
 
 def _get_ohlc_series(df: pd.DataFrame):
     """
-    Normalise OHLC columns to simple Series so we don't end up
-    with multi-column DataFrames when indexing, which breaks arithmetic.
+    Return OHLC as Series, even if df had odd structure originally.
     """
     def _col(name: str):
         if name not in df.columns:
             raise KeyError(f"Missing column {name} in price data")
         col = df[name]
-        # If this is a DataFrame (e.g. duplicate columns / MultiIndex), take first
         if isinstance(col, pd.DataFrame):
             return col.iloc[:, 0]
         return col
@@ -232,7 +250,7 @@ def _get_ohlc_series(df: pd.DataFrame):
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    _, high, low, close = _get_ohlc_series(df)
+    open_, high, low, close = _get_ohlc_series(df)
 
     returns = close.pct_change()
     df["ret"] = returns
@@ -271,15 +289,22 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ---------- RELAXED SCORING ----------
+
 def score_latest(df: pd.DataFrame):
-    # relaxed minimum history (about 6–8 months)
+    # relaxed minimum history
     if df.shape[0] < 130:
         return None
 
     latest = df.iloc[-1]
 
-    price = latest.get("Close", np.nan)
-    if pd.isna(price) or price <= 0:
+    # Price as scalar from normalized Close
+    try:
+        price = float(df["Close"].iloc[-1])
+    except Exception:
+        return None
+
+    if np.isnan(price) or price <= 0:
         return None
 
     ts_mom_20 = latest.get("ts_mom_20", 0.0)
@@ -391,6 +416,11 @@ def analyse_universe(tickers, period="1y", top_n=10):
             continue
 
         if df is None or df.empty:
+            continue
+
+        # Normalise any weird MultiIndex / duplicated columns
+        df = _normalize_price_df(df)
+        if "Close" not in df.columns or "High" not in df.columns or "Low" not in df.columns:
             continue
 
         data_ok += 1
