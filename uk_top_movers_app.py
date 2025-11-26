@@ -17,62 +17,100 @@ HEADERS = {
 
 # ---------- TICKER HELPERS ----------
 
-def _extract_tickers_from_tables(tables):
+def _get_tickers_from_wikipedia(url: str, min_count: int = 50) -> list[str]:
     """
-    Try to find a column that looks like UK tickers:
-    short strings (<6 chars), mostly uppercase, no spaces.
+    Fetch a Wikipedia page and extract tickers from the
+    constituents table that has a 'Ticker' or 'EPIC' column.
     """
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    tables = pd.read_html(r.text)
+
     for table in tables:
-        for col in table.columns:
-            series = table[col].astype(str).str.strip()
-            if series.empty:
-                continue
-            max_len = series.str.len().max()
-            if max_len > 6:
-                continue
-            # simple heuristic: majority uppercase & no spaces
-            sample = series.head(20)
-            no_space_ratio = (sample.str.contains(" ").sum()) / len(sample)
-            # if mostly no spaces and not too long, call it tickers
-            if no_space_ratio < 0.3:
-                tickers = series.tolist()
-                return [t for t in tickers if t and t != "nan"]
+        cols = [str(c) for c in table.columns]
+        # look for explicit ticker-like column names
+        ticker_col_name = None
+        for c in cols:
+            lc = c.lower()
+            if "ticker" in lc or "epic" in lc or "symbol" in lc:
+                ticker_col_name = c
+                break
+        if ticker_col_name is None:
+            continue
+
+        series = table[ticker_col_name].astype(str).str.strip()
+        # filter out junk
+        series = series[series.str.len().between(1, 6)]
+        tickers = [t for t in series.tolist() if t and t.lower() != "ticker"]
+        # sanity check on count so we don't grab a tiny table
+        if len(tickers) >= min_count:
+            return tickers
+
+    # fallback: nothing found
     return []
 
 
 @st.cache_data(show_spinner=False)
-def get_ftse100_tickers():
+def get_ftse100_tickers() -> list[str]:
     url = "https://en.wikipedia.org/wiki/FTSE_100_Index"
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    tables = pd.read_html(r.text)
-    tickers = _extract_tickers_from_tables(tables)
+    tickers = _get_tickers_from_wikipedia(url, min_count=80)
     return [t + ".L" for t in tickers]
 
 
 @st.cache_data(show_spinner=False)
-def get_ftse250_tickers():
+def get_ftse250_tickers() -> list[str]:
     url = "https://en.wikipedia.org/wiki/FTSE_250_Index"
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    tables = pd.read_html(r.text)
-    tickers = _extract_tickers_from_tables(tables)
+    tickers = _get_tickers_from_wikipedia(url, min_count=200)
     return [t + ".L" for t in tickers]
 
 
 @st.cache_data(show_spinner=False)
-def get_aim100_tickers():
-    # reasonably liquid subset: FTSE AIM 100
-    url = "https://en.wikipedia.org/wiki/FTSE_AIM_100_Index"
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    tables = pd.read_html(r.text)
-    tickers = _extract_tickers_from_tables(tables)
-    return [t + ".L" for t in tickers]
+def get_aim100_tickers() -> list[str]:
+    """
+    AIM 100 does not have a constituents table on Wikipedia.
+    We try the DigitalLook 'AIM constituents' page, which sometimes
+    exposes a table with an EPIC column. If that fails, return [].
+    """
+    try:
+        dl_url = (
+            "https://www.digitallook.com/cgi-bin/dlmedia/security.cgi?"
+            "security_classification_id=103317&country_id=1&trade_analysis=1&"
+            "csi=113101&target_csi=&id=113101&sub_action=&orderby_field=security_name&"
+            "price_type=closing_&intraday_prices=1&ac=&username=&action=constituents&"
+            "selected_menu_link=%2Fdlmedia%2Finvesting&order_by=column7&"
+            "view_data=standard&sequence=descending"
+        )
+        r = requests.get(dl_url, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        tables = pd.read_html(r.text)
+        for table in tables:
+            cols = [str(c) for c in table.columns]
+            epic_col = None
+            for c in cols:
+                lc = c.lower()
+                if "epic" in lc or "ticker" in lc or "symbol" in lc:
+                    epic_col = c
+                    break
+            if epic_col is None:
+                continue
+            series = table[epic_col].astype(str).str.strip()
+            series = series[series.str.len().between(1, 6)]
+            tickers = [t for t in series.tolist() if t and t.lower() != "epic"]
+            if len(tickers) >= 50:
+                return [t + ".L" for t in tickers]
+    except Exception:
+        pass
+
+    # If we get here, we couldn't fetch AIM 100 properly
+    st.warning(
+        "AIM 100 constituents could not be fetched from the external source. "
+        "AIM 100 / All UK will currently only include FTSE names."
+    )
+    return []
 
 
 @st.cache_data(show_spinner=False)
-def get_universe(universe: str):
+def get_universe(universe: str) -> list[str]:
     ftse100 = get_ftse100_tickers()
     ftse250 = get_ftse250_tickers()
     aim100 = get_aim100_tickers()
@@ -189,13 +227,14 @@ def score_latest(df: pd.DataFrame):
     if rsi > 80 or rsi < 20:
         core_signal *= 0.7
 
-    # Direction & expected move
+    # Direction & expected move (heuristic)
     if core_signal > 0:
         direction = "BUY"
     else:
         direction = "SELL"
 
     expected_abs_move = float(abs(core_signal) * 5.0)  # heuristic scaling to %
+
     # Timeframe: higher ATR/vol → shorter horizon
     if atr_pct > 0.03 or df["vol_20"].iloc[-1] > 0.025:
         timeframe = "short (1–7 days)"
@@ -239,9 +278,19 @@ def analyse_universe(tickers, period="1y", top_n=10, batch_size=30):
         except Exception:
             continue
 
+        # Handle both MultiIndex and single-index columns
         for t in batch:
             try:
-                df = data[t] if len(batch) > 1 else data
+                if isinstance(data.columns, pd.MultiIndex):
+                    # data columns like ('Close', 'AAPL') etc
+                    df = data.xs(t, level=1, axis=1)
+                else:
+                    if len(batch) == 1:
+                        df = data
+                    else:
+                        if t not in data:
+                            continue
+                        df = data[t]
             except Exception:
                 continue
 
@@ -275,11 +324,11 @@ def analyse_universe(tickers, period="1y", top_n=10, batch_size=30):
 # ---------- STREAMLIT UI ----------
 
 def main():
-    st.title("UK Top Movers Scanner 🇬🇧")
+    st.title("UK Top Movers Scanner GB")
     st.markdown(
-        "Quant-style heuristic scanner for UK stocks (FTSE 100 / 250 / 350 / AIM 100).  "
+        "Quant-style heuristic scanner for UK stocks (FTSE 100 / 250 / 350 / AIM 100). "
         "Uses volatility-scaled momentum, breakouts, and trend filters to highlight "
-        "candidates likely to move.  **Not financial advice.**"
+        "candidates likely to move. **Not financial advice.**"
     )
 
     universe = st.selectbox(
@@ -292,8 +341,8 @@ def main():
 
     period = st.selectbox(
         "Lookback period",
-        ["6mo", "1y", "2y"],
-        index=1,
+        ["1y", "2y"],
+        index=0,
         help="Longer lookback improves trend filters but increases load time.",
     )
 
@@ -305,7 +354,7 @@ def main():
         df_res = analyse_universe(tickers, period=period, top_n=top_n)
 
         if df_res.empty:
-            st.error("No results. Check connection and try again.")
+            st.error("No results. Try a different universe, or check connection and try again.")
             return
 
         st.subheader("Top predicted movers")
