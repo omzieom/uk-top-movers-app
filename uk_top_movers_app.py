@@ -43,7 +43,7 @@ def _get_tickers_from_wikipedia(url: str, min_count: int = 50) -> list:
         series = table[ticker_col_name].astype(str).str.strip()
         # filter out junk: short-ish, uppercase-ish, no spaces
         series = series[series.str.len().between(1, 6)]
-        series = series[~series.str.contains(" ", regex=False)]
+        series = series[series.str.contains(" ", regex=False) == False]
         tickers = [
             t
             for t in series.tolist()
@@ -100,7 +100,7 @@ def _get_aim_from_digitallook() -> list:
                 continue
             series = table[epic_col].astype(str).str.strip()
             series = series[series.str.len().between(1, 6)]
-            series = series[~series.str.contains(" ", regex=False)]
+            series = series[series.str.contains(" ", regex=False) == False]
             tickers = [
                 t
                 for t in series.tolist()
@@ -510,9 +510,35 @@ def analyse_universe(tickers, period="1y"):
         return pd.DataFrame()
 
     df_res = pd.DataFrame(results)
-    # Sort by TP % but do NOT trim; main() will apply top_n
     df_res = df_res.sort_values(by="take_profit_pct", ascending=False)
     return df_res
+
+
+# ---------- CONFIDENCE COLOURING ----------
+
+def confidence_style(row):
+    """
+    Colour the 'confidence' cell:
+      >= 0.8  -> green
+      0.5–0.8 -> amber
+      < 0.5   -> red
+    """
+    styles = [""] * len(row)
+    c = row.get("confidence", np.nan)
+    if pd.isna(c):
+        return styles
+
+    if c >= 0.8:
+        color = "#145A32"  # green
+    elif c >= 0.5:
+        color = "#B9770E"  # amber
+    else:
+        color = "#922B21"  # red
+
+    for i, col in enumerate(row.index):
+        if col == "confidence":
+            styles[i] = f"background-color: {color}; color: white;"
+    return styles
 
 
 # ---------- STREAMLIT UI ----------
@@ -596,8 +622,9 @@ def main():
     )
 
     st.subheader("Top predicted movers")
-    st.dataframe(
-        df_show.style.format(
+    styled = (
+        df_show.style
+        .format(
             {
                 "Last daily price": "{:.2f}",
                 "Exp move %": "{:.2f}",
@@ -607,7 +634,12 @@ def main():
                 "SL price": "{:.4f}",
                 "TP price": "{:.4f}",
             }
-        ),
+        )
+        .apply(confidence_style, axis=1)
+    )
+
+    st.dataframe(
+        styled,
         use_container_width=True,
         hide_index=True,
     )
