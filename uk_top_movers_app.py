@@ -21,7 +21,7 @@ HEADERS = {
 def _get_tickers_from_wikipedia(url: str, min_count: int = 50) -> list:
     """
     Fetch a Wikipedia page and extract tickers from the
-    constituents table that has a 'Ticker' / 'EPIC' / 'Symbol' column.
+    constituents table that has a 'Ticker' / 'EPIC' / 'Symbol' / 'Code' column.
     """
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
@@ -41,10 +41,14 @@ def _get_tickers_from_wikipedia(url: str, min_count: int = 50) -> list:
             continue
 
         series = table[ticker_col_name].astype(str).str.strip()
-        # filter out junk: short-ish, mostly no spaces
+        # filter out junk: short-ish, uppercase-ish, no spaces
         series = series[series.str.len().between(1, 6)]
         series = series[~series.str.contains(" ", regex=False)]
-        tickers = [t for t in series.tolist() if t and t.lower() not in ("ticker", "epic", "symbol")]
+        tickers = [
+            t
+            for t in series.tolist()
+            if t and t.lower() not in ("ticker", "epic", "symbol", "code")
+        ]
         if len(tickers) >= min_count:
             return tickers
 
@@ -97,8 +101,12 @@ def _get_aim_from_digitallook() -> list:
             series = table[epic_col].astype(str).str.strip()
             series = series[series.str.len().between(1, 6)]
             series = series[~series.str.contains(" ", regex=False)]
-            tickers = [t for t in series.tolist() if t and t.lower() not in ("epic", "ticker", "symbol")]
-            if len(tickers) >= 40:  # sanity check
+            tickers = [
+                t
+                for t in series.tolist()
+                if t and t.lower() not in ("epic", "ticker", "symbol", "code")
+            ]
+            if len(tickers) >= 40:
                 return [t + ".L" for t in tickers]
     except Exception:
         pass
@@ -108,9 +116,9 @@ def _get_aim_from_digitallook() -> list:
 
 def _get_aim_from_yahoo_screener() -> list:
     """
-    Best-effort fallback: use Yahoo Finance screener API to get UK/LSE small caps.
-    This is NOT guaranteed to be strictly 'AIM 100', but gives a decent AIM-like universe.
-    Fully wrapped in try/except; returns [] on any failure.
+    Fallback: use Yahoo Finance screener API to get UK/LSE small caps.
+    Not strictly 'AIM 100', but gives an AIM-like universe.
+    Fully wrapped in try/except; returns [] on failure.
     """
     try:
         url = "https://query1.finance.yahoo.com/v1/finance/screener"
@@ -126,8 +134,7 @@ def _get_aim_from_yahoo_screener() -> list:
                 "operands": [
                     {"operator": "EQ", "operands": ["GB", "region"]},
                     {"operator": "EQ", "operands": ["LSE", "exchange"]},
-                    # Yahoo doesn’t have a clean “AIM index” flag publicly,
-                    # but smaller caps tend to approximate AIM universe.
+                    # proxy for smaller caps
                     {"operator": "LT", "operands": [2_000_000_000, "marketcap"]},
                 ],
             },
@@ -139,14 +146,12 @@ def _get_aim_from_yahoo_screener() -> list:
         r = requests.post(url, json=payload, headers=headers, timeout=20)
         r.raise_for_status()
         js = r.json()
-        # structure: finance -> result[0] -> quotes
         quotes = (
             js.get("finance", {})
             .get("result", [{}])[0]
             .get("quotes", [])
         )
         symbols = [q.get("symbol") for q in quotes if isinstance(q, dict) and q.get("symbol")]
-        # Keep only .L symbols to stay on LSE
         symbols = [s for s in symbols if s.endswith(".L")]
         return symbols
     except Exception:
@@ -156,23 +161,22 @@ def _get_aim_from_yahoo_screener() -> list:
 @st.cache_data(show_spinner=False)
 def get_aim100_tickers() -> list:
     """
-    AIM 100 or AIM-like universe:
-    1) Try DigitalLook constituents table.
+    AIM 100 / AIM-like universe:
+    1) Try DigitalLook.
     2) If that fails or is too small, fallback to Yahoo screener.
-    3) If both fail, return [] and show a warning in the UI.
+    3) If both fail, return [] and show a warning.
     """
     tickers = _get_aim_from_digitallook()
     if len(tickers) >= 40:
         return tickers
 
-    # fallback to Yahoo screener
     yf_tickers = _get_aim_from_yahoo_screener()
     if len(yf_tickers) >= 40:
         return yf_tickers
 
     st.warning(
-        "AIM 100 / AIM-like tickers could not be reliably fetched from external sources. "
-        "The AIM 100 and All UK universes will currently only include FTSE names."
+        "AIM 100 / AIM-like tickers could not be reliably fetched. "
+        "AIM 100 and All UK will currently only include FTSE names."
     )
     return []
 
@@ -206,7 +210,7 @@ def get_universe(universe: str) -> list:
     return uniq
 
 
-# ---------- INDICATORS & RELAXED QUANT-STYLE SCORING ----------
+# ---------- INDICATORS & RELAXED SCORING ----------
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -214,29 +218,24 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     high = df["High"]
     low = df["Low"]
 
-    # Returns & volatility
     returns = close.pct_change()
     df["ret"] = returns
     df["vol_20"] = returns.rolling(20, min_periods=10).std()
     df["vol_60"] = returns.rolling(60, min_periods=20).std()
 
-    # Time-series momentum (20d & 60d), volatility-scaled (Sharpe-like)
     df["mom_20"] = close.pct_change(20)
     df["mom_60"] = close.pct_change(60)
     df["ts_mom_20"] = df["mom_20"] / (df["vol_20"] * np.sqrt(20))
     df["ts_mom_60"] = df["mom_60"] / (df["vol_60"] * np.sqrt(60))
 
-    # Donchian-style breakout (55-day)
     high55 = close.rolling(55, min_periods=20).max()
     low55 = close.rolling(55, min_periods=20).min()
     df["breakout_up"] = (close - high55) / high55
     df["breakout_down"] = (close - low55) / low55
 
-    # Trend filter (50 & 200 day MAs)
     df["ma_50"] = close.rolling(50, min_periods=25).mean()
     df["ma_200"] = close.rolling(200, min_periods=60).mean()
 
-    # ATR (14) - volatility range
     prev_close = close.shift(1)
     tr = pd.concat(
         [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
@@ -245,7 +244,6 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ATR"] = tr.rolling(14, min_periods=7).mean()
     df["atr_pct"] = df["ATR"] / close
 
-    # RSI (14) for overbought/oversold context
     delta = close.diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
@@ -258,36 +256,32 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def score_latest(df: pd.DataFrame):
-    # Relaxed history requirement: ~160 trading days (~8 months)
-    if df.shape[0] < 160:
+    # relaxed minimum history (about 6-8 months)
+    if df.shape[0] < 130:
         return None
 
     latest = df.iloc[-1]
 
-    # Pull metrics and be forgiving with NaNs
-    ts_mom_20 = latest.get("ts_mom_20", np.nan)
-    ts_mom_60 = latest.get("ts_mom_60", np.nan)
-    breakout_up = latest.get("breakout_up", np.nan)
-    breakout_down = latest.get("breakout_down", np.nan)
-    ma50 = latest.get("ma_50", np.nan)
-    ma200 = latest.get("ma_200", np.nan)
+    # Core fields
     price = latest.get("Close", np.nan)
-    atr_pct = latest.get("atr_pct", np.nan)
-    rsi = latest.get("RSI", np.nan)
-
-    # We absolutely need a price
     if pd.isna(price) or price <= 0:
         return None
 
-    # Replace NaNs for non-critical metrics with 0 / neutral values
-    for name in ("ts_mom_20", "ts_mom_60", "breakout_up", "breakout_down"):
-        pass  # just a reminder in comments
+    ts_mom_20 = latest.get("ts_mom_20", 0.0)
+    ts_mom_60 = latest.get("ts_mom_60", 0.0)
+    breakout_up = latest.get("breakout_up", 0.0)
+    breakout_down = latest.get("breakout_down", 0.0)
+    ma50 = latest.get("ma_50", np.nan)
+    ma200 = latest.get("ma_200", np.nan)
+    atr_pct = latest.get("atr_pct", np.nan)
+    rsi = latest.get("RSI", np.nan)
+
     ts_mom_20 = 0.0 if pd.isna(ts_mom_20) else float(ts_mom_20)
     ts_mom_60 = 0.0 if pd.isna(ts_mom_60) else float(ts_mom_60)
     breakout_up = 0.0 if pd.isna(breakout_up) else float(breakout_up)
     breakout_down = 0.0 if pd.isna(breakout_down) else float(breakout_down)
 
-    # Trend regime: use ma50/ma200 if available, else treat as neutral
+    # Trend regime
     trend_regime = 0
     if not pd.isna(ma50) and not pd.isna(ma200):
         ma50 = float(ma50)
@@ -297,20 +291,20 @@ def score_latest(df: pd.DataFrame):
         elif price < ma50 < ma200:
             trend_regime = -1
 
-    # ATR pct: if missing, approximate with recent vol
+    # ATR pct fallback
     if pd.isna(atr_pct) or atr_pct <= 0:
         fallback_vol = df["ret"].rolling(20).std().iloc[-1]
         atr_pct = float(fallback_vol) if not pd.isna(fallback_vol) else 0.02
     else:
         atr_pct = float(atr_pct)
 
-    # RSI: neutral if missing
+    # RSI fallback
     if pd.isna(rsi):
         rsi = 50.0
     else:
         rsi = float(rsi)
 
-    # Core signal: volatility-scaled momentum + breakout
+    # Core signal
     core_signal = (
         0.6 * ts_mom_20 +
         0.4 * ts_mom_60 +
@@ -318,27 +312,23 @@ def score_latest(df: pd.DataFrame):
         1.0 * breakout_down
     )
 
-    # Trend weighting: boost when aligned, soften when neutral
+    # Trend weighting
     if trend_regime == 1 and core_signal > 0:
         core_signal *= 1.3
     elif trend_regime == -1 and core_signal < 0:
         core_signal *= 1.3
     elif trend_regime == 0:
-        core_signal *= 0.9  # mild reduction, not a killer
+        core_signal *= 0.9
 
-    # RSI guardrails only for very extreme conditions
+    # Very extreme RSI only
     if rsi > 85 or rsi < 15:
         core_signal *= 0.85
 
-    # Direction & expected move (still heuristic)
-    if core_signal >= 0:
-        direction = "BUY"
-    else:
-        direction = "SELL"
+    # Direction & expected move (heuristic)
+    direction = "BUY" if core_signal >= 0 else "SELL"
+    expected_abs_move = float(abs(core_signal) * 5.0)
 
-    expected_abs_move = float(abs(core_signal) * 5.0)  # scaled to a % range
-
-    # Timeframe: higher ATR/vol → shorter horizon
+    # Timeframe by volatility
     vol_20 = df["vol_20"].iloc[-1]
     vol_20 = 0.0 if pd.isna(vol_20) else float(vol_20)
     if atr_pct > 0.03 or vol_20 > 0.025:
@@ -346,7 +336,6 @@ def score_latest(df: pd.DataFrame):
     else:
         timeframe = "medium (1–4 weeks)"
 
-    # Confidence: squash |signal| into (0,1)
     confidence = float(np.tanh(abs(core_signal)))
 
     return {
@@ -358,66 +347,63 @@ def score_latest(df: pd.DataFrame):
     }
 
 
-# ---------- SCAN UNIVERSE ----------
+# ---------- SCAN UNIVERSE (SIMPLE, PER-TICKER) ----------
 
 
 @st.cache_data(show_spinner=True)
-def analyse_universe(tickers, period="1y", top_n=10, batch_size=30):
+def analyse_universe(tickers, period="1y", top_n=10):
     results = []
     tickers = list(dict.fromkeys(tickers))  # de-duplicate
 
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
-        st.write(
-            f"[{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}] "
-            f"Downloading batch {i}-{i + len(batch) - 1} ({len(batch)} tickers)…"
-        )
+    n = len(tickers)
+    if n == 0:
+        return pd.DataFrame()
+
+    progress = st.progress(0)
+    data_ok = 0
+    scored_ok = 0
+
+    for idx, t in enumerate(tickers, start=1):
+        progress.progress(idx / n)
         try:
-            data = yf.download(
-                batch,
+            df = yf.download(
+                t,
                 period=period,
                 interval="1d",
-                group_by="ticker",
                 auto_adjust=False,
                 progress=False,
-                threads=True,
             )
-        except Exception:
+        except Exception as e:
+            st.write(f"{t}: download error {e}")
             continue
 
-        # Handle both MultiIndex and simple column structures
-        for t in batch:
-            try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    df = data.xs(t, level=1, axis=1)
-                else:
-                    if len(batch) == 1:
-                        df = data
-                    else:
-                        if t not in data:
-                            continue
-                        df = data[t]
-            except Exception:
-                continue
+        if df is None or df.empty:
+            continue
 
-            if df is None or df.empty:
-                continue
+        data_ok += 1
 
-            df = compute_indicators(df)
-            scored = score_latest(df)
-            if not scored:
-                continue
+        df = compute_indicators(df)
+        scored = score_latest(df)
+        if not scored:
+            continue
 
-            results.append(
-                {
-                    "ticker": t,
-                    "close": scored["price"],
-                    "expected_movement_pct": scored["expected_movement_pct"],
-                    "direction": scored["direction"],
-                    "timeframe": scored["timeframe"],
-                    "confidence": scored["confidence"],
-                }
-            )
+        scored_ok += 1
+
+        results.append(
+            {
+                "ticker": t,
+                "close": scored["price"],
+                "expected_movement_pct": scored["expected_movement_pct"],
+                "direction": scored["direction"],
+                "timeframe": scored["timeframe"],
+                "confidence": scored["confidence"],
+            }
+        )
+
+    st.write(
+        f"Tickers with price data: {data_ok} | "
+        f"Tickers with valid score: {scored_ok}"
+    )
 
     if not results:
         return pd.DataFrame()
@@ -434,7 +420,7 @@ def analyse_universe(tickers, period="1y", top_n=10, batch_size=30):
 def main():
     st.title("UK Top Movers Scanner GB")
     st.markdown(
-        "Quant-style heuristic scanner for UK stocks (FTSE 100 / 250 / 350 / AIM 100). "
+        "Quant-style heuristic scanner for UK stocks (FTSE 100 / 250 / 350 / AIM-ish). "
         "Uses volatility-scaled momentum, breakouts, and trend filters to highlight "
         "candidates likely to move. **Not financial advice.**"
     )
@@ -451,20 +437,21 @@ def main():
         "Lookback period",
         ["1y", "2y"],
         index=0,
-        help="Longer lookback improves trend filters but increases load time.",
+        help="Longer lookback gives better trend information but takes longer.",
     )
 
     if st.button("Run scan"):
         with st.spinner("Fetching tickers…"):
             tickers = get_universe(universe)
-        st.write(f"Analysing **{len(tickers)}** tickers. This can take a few minutes.")
+        st.write(f"Analysing **{len(tickers)}** tickers.")
 
         df_res = analyse_universe(tickers, period=period, top_n=top_n)
 
         if df_res.empty:
             st.error(
-                "No results. Try a different universe, ensure your internet connection is ok, "
-                "or switch to 2y lookback for more history."
+                "No results. Check the counts just above: "
+                "if 'tickers with price data' is 0, Yahoo Finance may be blocking or failing. "
+                "If data > 0 but 'valid score' is 0, we can relax filters further."
             )
             return
 
