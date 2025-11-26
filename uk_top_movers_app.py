@@ -295,7 +295,7 @@ def score_latest(df: pd.DataFrame):
 
     latest = df.iloc[-1]
 
-    # Price as scalar from normalized Close
+    # Price as scalar from normalized Close (last daily price)
     try:
         price = float(df["Close"].iloc[-1])
     except Exception:
@@ -408,6 +408,33 @@ def score_latest(df: pd.DataFrame):
     }
 
 
+# ---------- LIVE PRICE HELPER (SINGLE TICKER) ----------
+
+def get_live_price(ticker: str):
+    """
+    Best-effort near-live price for a single ticker.
+    Tries 1d/1m history first, then fast_info as fallback.
+    Returns float or None.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        # Try intraday 1m data for today
+        hist = t.history(period="1d", interval="1m")
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            return float(hist["Close"].iloc[-1])
+
+        # Fallback: use fast_info last_price if available
+        info = getattr(t, "fast_info", None)
+        if info is not None:
+            last_price = getattr(info, "last_price", None) or getattr(info, "last", None)
+            if last_price is not None:
+                return float(last_price)
+
+        return None
+    except Exception:
+        return None
+
+
 # ---------- SCAN UNIVERSE (PER-TICKER) ----------
 
 
@@ -483,9 +510,9 @@ def analyse_universe(tickers, period="1y", top_n=10):
         return pd.DataFrame()
 
     df_res = pd.DataFrame(results)
-    df_res["rank_key"] = df_res["expected_movement_pct"] * df_res["confidence"]
-    df_res = df_res.sort_values(by="rank_key", ascending=False).head(top_n)
-    return df_res.drop(columns=["rank_key"])
+    # Rank by take-profit % (highest target first)
+    df_res = df_res.sort_values(by="take_profit_pct", ascending=False).head(top_n)
+    return df_res
 
 
 # ---------- STREAMLIT UI ----------
@@ -514,12 +541,19 @@ def main():
         help="Longer lookback gives better trend information but takes longer.",
     )
 
+    direction_filter = st.selectbox(
+        "Show signals",
+        ["BUY & SELL", "BUY only", "SELL only"],
+        index=0,
+    )
+
     if st.button("Run scan"):
         with st.spinner("Fetching tickers…"):
             tickers = get_universe(universe)
         st.write(f"Analysing **{len(tickers)}** tickers.")
 
-        df_res = analyse_universe(tickers, period=period, top_n=top_n)
+        # oversample a bit so filtering still leaves enough names
+        df_res = analyse_universe(tickers, period=period, top_n=top_n * 3)
 
         if df_res.empty:
             st.error(
@@ -529,22 +563,102 @@ def main():
             )
             return
 
+        # Apply BUY/SELL filter
+        if direction_filter == "BUY only":
+            df_res = df_res[df_res["direction"] == "BUY"]
+        elif direction_filter == "SELL only":
+            df_res = df_res[df_res["direction"] == "SELL"]
+
+        if df_res.empty:
+            st.warning("No signals match that direction filter.")
+            return
+
+        # Re-sort and limit to top_n after filtering
+        df_res = df_res.sort_values(by="take_profit_pct", ascending=False).head(top_n)
+
+        # Prepare a nicer display version with shorter headers
+        df_show = df_res.rename(
+            columns={
+                "close": "Last daily price",
+                "expected_movement_pct": "Exp move %",
+                "stop_loss_pct": "SL %",
+                "take_profit_pct": "TP %",
+                "stop_loss_price": "SL price",
+                "take_profit_price": "TP price",
+            }
+        )
+
         st.subheader("Top predicted movers")
         st.dataframe(
-            df_res.style.format(
+            df_show.style.format(
                 {
-                    "close": "{:.2f}",
-                    "expected_movement_pct": "{:.2f}",
+                    "Last daily price": "{:.2f}",
+                    "Exp move %": "{:.2f}",
                     "confidence": "{:.2f}",
-                    "stop_loss_pct": "{:.2f}",
-                    "take_profit_pct": "{:.2f}",
-                    "stop_loss_price": "{:.4f}",
-                    "take_profit_price": "{:.4f}",
+                    "SL %": "{:.2f}",
+                    "TP %": "{:.2f}",
+                    "SL price": "{:.4f}",
+                    "TP price": "{:.4f}",
                 }
             ),
             use_container_width=True,
+            hide_index=True,  # no row numbers
         )
 
+        # ----- Single-ticker live refresh -----
+        st.markdown("### Live price & SL/TP update for a single ticker")
+
+        tickers_available = df_res["ticker"].tolist()
+        selected_ticker = st.selectbox(
+            "Select a ticker from the current results",
+            tickers_available,
+        )
+
+        if st.button("Refresh live price for selected ticker"):
+            live_price = get_live_price(selected_ticker)
+            if live_price is None:
+                st.warning(
+                    f"Could not fetch a live price for {selected_ticker}. "
+                    "Yahoo Finance may not have intraday data or is rate-limiting."
+                )
+            else:
+                row = df_res[df_res["ticker"] == selected_ticker].iloc[0]
+                direction = row["direction"]
+                sl_pct = row["stop_loss_pct"]
+                tp_pct = row["take_profit_pct"]
+                last_daily_price = row["close"]
+
+                if direction == "BUY":
+                    new_sl_price = live_price * (1.0 - sl_pct / 100.0)
+                    new_tp_price = live_price * (1.0 + tp_pct / 100.0)
+                else:  # SELL
+                    new_sl_price = live_price * (1.0 + sl_pct / 100.0)
+                    new_tp_price = live_price * (1.0 - tp_pct / 100.0)
+
+                comparison = pd.DataFrame(
+                    [
+                        {
+                            "ticker": selected_ticker,
+                            "direction": direction,
+                            "Last daily price": round(last_daily_price, 4),
+                            "Live price": round(live_price, 4),
+                            "SL %": round(sl_pct, 2),
+                            "TP %": round(tp_pct, 2),
+                            "Original SL price": round(row["stop_loss_price"], 4),
+                            "Original TP price": round(row["take_profit_price"], 4),
+                            "Updated SL price": round(new_sl_price, 4),
+                            "Updated TP price": round(new_tp_price, 4),
+                        }
+                    ]
+                )
+
+                st.dataframe(
+                    comparison,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        # CSV download uses full column names (df_res)
         csv = df_res.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download results as CSV",
