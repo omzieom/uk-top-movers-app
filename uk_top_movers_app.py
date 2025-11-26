@@ -215,15 +215,12 @@ def _normalize_price_df(df: pd.DataFrame) -> pd.DataFrame:
     Make sure df has simple, non-duplicated OHLC columns.
     Handles occasional MultiIndex or duplicate column names from yfinance.
     """
-    # Flatten MultiIndex by taking the first level
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = [col[0] for col in df.columns]
 
-    # Drop duplicate columns, keep first
     df = df.loc[:, ~df.columns.duplicated()]
 
-    # Keep only columns we care about if present
     wanted = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
     df = df[wanted].copy()
 
@@ -289,7 +286,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------- RELAXED SCORING ----------
+# ---------- RELAXED SCORING + SL/TP ----------
 
 def score_latest(df: pd.DataFrame):
     # relaxed minimum history
@@ -364,9 +361,17 @@ def score_latest(df: pd.DataFrame):
     if rsi > 85 or rsi < 15:
         core_signal *= 0.85
 
+    # Direction
     direction = "BUY" if core_signal >= 0 else "SELL"
+
+    # Expected move (heuristic)
     expected_abs_move = float(abs(core_signal) * 5.0)
 
+    # Confidence (0–0.99, not a literal probability)
+    confidence_raw = np.tanh(abs(core_signal))
+    confidence = float(min(confidence_raw, 0.99))
+
+    # Timeframe by volatility
     vol_20 = df["vol_20"].iloc[-1]
     vol_20 = 0.0 if pd.isna(vol_20) else float(vol_20)
     if atr_pct > 0.03 or vol_20 > 0.025:
@@ -374,7 +379,21 @@ def score_latest(df: pd.DataFrame):
     else:
         timeframe = "medium (1–4 weeks)"
 
-    confidence = float(np.tanh(abs(core_signal)))
+    # --- Stop loss / Take profit using ATR multiples ---
+    # Base risk: 1.5 x ATR
+    sl_atr_mult = 1.5
+    # Reward: between 1.5x and 3x ATR depending on confidence
+    tp_atr_mult = 1.5 + 1.5 * confidence
+
+    sl_pct = atr_pct * sl_atr_mult * 100.0
+    tp_pct = atr_pct * tp_atr_mult * 100.0
+
+    if direction == "BUY":
+        stop_loss_price = price * (1.0 - sl_pct / 100.0)
+        take_profit_price = price * (1.0 + tp_pct / 100.0)
+    else:  # SELL
+        stop_loss_price = price * (1.0 + sl_pct / 100.0)
+        take_profit_price = price * (1.0 - tp_pct / 100.0)
 
     return {
         "price": float(price),
@@ -382,6 +401,10 @@ def score_latest(df: pd.DataFrame):
         "direction": direction,
         "timeframe": timeframe,
         "confidence": round(confidence, 2),
+        "stop_loss_pct": round(sl_pct, 2),
+        "take_profit_pct": round(tp_pct, 2),
+        "stop_loss_price": round(stop_loss_price, 4),
+        "take_profit_price": round(take_profit_price, 4),
     }
 
 
@@ -418,7 +441,6 @@ def analyse_universe(tickers, period="1y", top_n=10):
         if df is None or df.empty:
             continue
 
-        # Normalise any weird MultiIndex / duplicated columns
         df = _normalize_price_df(df)
         if "Close" not in df.columns or "High" not in df.columns or "Low" not in df.columns:
             continue
@@ -445,6 +467,10 @@ def analyse_universe(tickers, period="1y", top_n=10):
                 "direction": scored["direction"],
                 "timeframe": scored["timeframe"],
                 "confidence": scored["confidence"],
+                "stop_loss_pct": scored["stop_loss_pct"],
+                "take_profit_pct": scored["take_profit_pct"],
+                "stop_loss_price": scored["stop_loss_price"],
+                "take_profit_price": scored["take_profit_price"],
             }
         )
 
@@ -510,6 +536,10 @@ def main():
                     "close": "{:.2f}",
                     "expected_movement_pct": "{:.2f}",
                     "confidence": "{:.2f}",
+                    "stop_loss_pct": "{:.2f}",
+                    "take_profit_pct": "{:.2f}",
+                    "stop_loss_price": "{:.4f}",
+                    "take_profit_price": "{:.4f}",
                 }
             ),
             use_container_width=True,
