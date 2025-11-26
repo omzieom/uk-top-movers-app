@@ -134,7 +134,6 @@ def _get_aim_from_yahoo_screener() -> list:
                 "operands": [
                     {"operator": "EQ", "operands": ["GB", "region"]},
                     {"operator": "EQ", "operands": ["LSE", "exchange"]},
-                    # proxy for smaller caps
                     {"operator": "LT", "operands": [2_000_000_000, "marketcap"]},
                 ],
             },
@@ -200,7 +199,6 @@ def get_universe(universe: str) -> list:
     else:
         tickers = ftse100
 
-    # de-duplicate but keep order
     seen = set()
     uniq = []
     for t in tickers:
@@ -212,11 +210,29 @@ def get_universe(universe: str) -> list:
 
 # ---------- INDICATORS & RELAXED SCORING ----------
 
+def _get_ohlc_series(df: pd.DataFrame):
+    """
+    Normalise OHLC columns to simple Series so we don't end up
+    with multi-column DataFrames when indexing, which breaks arithmetic.
+    """
+    def _col(name: str):
+        if name not in df.columns:
+            raise KeyError(f"Missing column {name} in price data")
+        col = df[name]
+        # If this is a DataFrame (e.g. duplicate columns / MultiIndex), take first
+        if isinstance(col, pd.DataFrame):
+            return col.iloc[:, 0]
+        return col
+
+    open_ = _col("Open")
+    high = _col("High")
+    low = _col("Low")
+    close = _col("Close")
+    return open_, high, low, close
+
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
+    _, high, low, close = _get_ohlc_series(df)
 
     returns = close.pct_change()
     df["ret"] = returns
@@ -256,13 +272,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def score_latest(df: pd.DataFrame):
-    # relaxed minimum history (about 6-8 months)
+    # relaxed minimum history (about 6–8 months)
     if df.shape[0] < 130:
         return None
 
     latest = df.iloc[-1]
 
-    # Core fields
     price = latest.get("Close", np.nan)
     if pd.isna(price) or price <= 0:
         return None
@@ -324,11 +339,9 @@ def score_latest(df: pd.DataFrame):
     if rsi > 85 or rsi < 15:
         core_signal *= 0.85
 
-    # Direction & expected move (heuristic)
     direction = "BUY" if core_signal >= 0 else "SELL"
     expected_abs_move = float(abs(core_signal) * 5.0)
 
-    # Timeframe by volatility
     vol_20 = df["vol_20"].iloc[-1]
     vol_20 = 0.0 if pd.isna(vol_20) else float(vol_20)
     if atr_pct > 0.03 or vol_20 > 0.025:
@@ -347,13 +360,13 @@ def score_latest(df: pd.DataFrame):
     }
 
 
-# ---------- SCAN UNIVERSE (SIMPLE, PER-TICKER) ----------
+# ---------- SCAN UNIVERSE (PER-TICKER) ----------
 
 
 @st.cache_data(show_spinner=True)
 def analyse_universe(tickers, period="1y", top_n=10):
     results = []
-    tickers = list(dict.fromkeys(tickers))  # de-duplicate
+    tickers = list(dict.fromkeys(tickers))
 
     n = len(tickers)
     if n == 0:
@@ -382,7 +395,12 @@ def analyse_universe(tickers, period="1y", top_n=10):
 
         data_ok += 1
 
-        df = compute_indicators(df)
+        try:
+            df = compute_indicators(df)
+        except Exception as e:
+            st.write(f"{t}: indicator error {e}")
+            continue
+
         scored = score_latest(df)
         if not scored:
             continue
